@@ -1,0 +1,14 @@
+# build outputs: make build / netd (sandpitd, sandpit-netd), go test -c
+/bin/
+*.test
+# a local data directory, worktrees and agent state
+/data/
+/.worktrees/
+/.claude/
+# scripts/build-envd.sh (and its partial output)
+/images/e2b/envd
+/images/e2b/envd.tmp
+# what e2e/providers/*/run.sh install beside themselves
+/e2e/providers/*/node_modules/
+/e2e/providers/*/.venv/
+/e2e/providers/*/golden/.proxy-*

@@ -1,0 +1,8 @@
+{
+  "name": "sandpit-e2b-probe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "e2b": "2.52.0"
+  }
+}

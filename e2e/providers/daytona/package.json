@@ -1,0 +1,8 @@
+{
+  "name": "sandpit-daytona-probe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@daytonaio/sdk": "0.220.0"
+  }
+}

@@ -1,0 +1,336 @@
+# Sprites from container images
+
+Ours, not upstream's: a sprite can start from any container image instead of the base image.
+
+```sh
+curl $SPRITES_API_URL/v1/sprites -H "Authorization: Bearer $SPRITE_TOKEN" \
+  -d '{"name": "web", "from": {"image": "docker.io/library/node:22"}}'
+```
+
+`from.image` sits beside the existing `from.sprite`/`from.checkpoint` (a clone); give one or
+the other. References are written the way docker takes them: `node:22`, `alpine`,
+`ghcr.io/owner/app:v1`, `python@sha256:...`. They are normalized (`node:22` is
+`docker.io/library/node:22`, no tag is `:latest`) and must be registry references: transports
+such as `oci:`, `docker://` or `containers-storage:` are refused, since they would let a
+caller name files on the host. `localhost/<name>` is an image in the daemon user's own podman
+storage (something you built with `podman build`) and is never pulled.
+
+The new sprite's `source_image` field (ours) records the image, pinned by the digest it was
+pulled at. A checkpoint clone of it inherits the field.
+
+The official SDKs have no way to send `from`, so this is a raw HTTP call (or `sprite-env`, below).
+
+## The cache, and when a pull happens
+
+sandpitd pulls the image with rootless podman, flattens it into an ext4 disk, and keeps that
+disk in a cache under `<data>/vm/.images/`, one per image ID. Every create from it afterwards
+clones the cached disk exactly as checkpoints are cloned: instant on a reflink volume, a
+sparse copy otherwise (measured on a plain tmpfs, no reflink: 0.19 s for node:22's 1.1 GB, 5 ms
+for alpine).
+
+- **A create whose image is not cached pulls it and blocks** until the disk is built
+  (node:22: 11 s on a fast line, of which the flatten is a few seconds). The pull is detached
+  from the request: a client that gives up does not cancel it, and a retry finds the disk
+  ready. Concurrent creates of the same image share one pull.
+- **A create whose image is cached never contacts the registry**, even for a tag that has
+  since moved. A tag is refreshed only by an explicit `sandpitd images pull`; if it now names a
+  different image, the reference moves to a new disk and the old disk, if nothing else refers
+  to it, is deleted. Sprites made from the old one are unaffected (they are copies).
+- **Clients with short timeouts** (the SDKs' default is 30 s) should not trigger a cold pull:
+  pull ahead of time with `sandpitd images pull`.
+
+```
+$ sandpitd images pull node:22
+pulling docker.io/library/node:22
+Trying to pull docker.io/library/node:22...
+...
+cached docker.io/library/node:22 as image 3112e746c449 in 11s (shell: /bin/bash, own sudo: false)
+$ sandpitd images list
+ID            REFS                                SHELL      SUDO      UID   IMAGE  DISK  BUILT     LAST USED
+3112e746c449  docker.io/library/node:22           /bin/bash  stand-in  1001  1.1G   1.1G  2m ago    just now
+d01fbf53dae0  localhost/sandpit-base:latest       /bin/bash  image's   1000  554M   582M  just now  just now
+$ sandpitd images rm node:22          # or an ID prefix of 12+ characters
+```
+
+`images` talks to the running daemon over the operator socket (`<data>/sandpitd.sock`, like
+`status`), so it needs no token, and the cache cannot be managed through the API token at all.
+`list` also works with no daemon running. `--json` prints the records.
+
+A pull adds the image to podman's own storage (the daemon user's `~/.local/share/containers`)
+only for as long as the build takes: a reference the pull introduced is removed again
+afterwards, while one that was already there is the operator's and is left alone. Private
+registries work if the daemon's user has logged in with `podman login`.
+
+## From inside a sprite
+
+A sprite with a [spawn policy](api.md#sprites-that-create-sprites) may create sprites from
+images, but **only from images already in the cache**. A guest can never make the host
+pull: that would let it fetch arbitrary content and fill the disk. An uncached image is a
+`404 image_not_cached` that names the reference.
+
+```sh
+sprite-env sprites create game-7 --image node:22 --public
+```
+
+## What a disk built from an image contains
+
+Everything in the image, plus what the base image adds on top of ubuntu and the agent relies on:
+
+- a `sprite` account that exec sessions and services run as: uid and gid 1000 as in the base
+  image, or the next free ids when the image already uses 1000 (node's images have a `node`
+  user there). An image that already has a `sprite` account keeps its own.
+- its home, `/home/sprite`, seeded from the image's `/etc/skel`;
+- a locked entry in `/etc/shadow` and `/etc/gshadow` where the image has those files, and a
+  NOPASSWD sudoers entry where the image has sudo;
+- `/.sprite/image.json`: the reference, digest and the image's environment (`ENV`).
+
+The image's environment is applied to every exec session and service, over the agent's base
+environment, the way a container would get it: `PATH` additions such as `/usr/local/go/bin`,
+`NODE_VERSION`, `PYTHON_VERSION`. `HOME`, `USER`, `LOGNAME` and `SHELL` stay the sprite
+user's, and `/usr/local/bin` is kept on `PATH` for `sprite-env`. `ENTRYPOINT`, `CMD`,
+`USER`, `WORKDIR`, `EXPOSE` and volumes are ignored: a sprite is a machine, not a container;
+run the image's program as a service if you want it running.
+
+Hostname, `/etc/hosts`, `resolv.conf`, `/proc` and the rest are set up by the agent at boot, as
+for any sprite. Ownership, modes, hard links, setuid bits and file capabilities (xattrs) are
+carried over: the flatten is `podman export` into a tar that mke2fs reads directly, so no user
+namespace is involved (this needs e2fsprogs 1.47.1 or newer, whose `mkfs.ext4 -d` takes a tar).
+
+The disk has the base image's size (20 GB apparent, sparse; `SPRITE_DISK_GB` at `make image`).
+
+### Sudo
+
+Most images ship no sudo (node, python, alpine, busybox, distroless), which would leave the
+sprite user no way to install a package. On such a disk the agent installs a **stand-in** at
+every boot: a setuid-root copy of `sprite-env` at `/.sprite/bin/sudo`, linked from
+`/usr/local/bin/sudo`. It gives the sprite user (and only that user) root without a password,
+like the base image's sudoers entry, and understands the options scripts commonly use (`-u`,
+`-E`, `-H`, `-i`, `-s`, `-n`, `-k`, `-v`, `-l`); anything else is refused with an error rather
+than ignored. The environment is reset as sudo's `env_reset` does, unless `-E`. As soon as the
+disk has a real sudo (`apt-get install sudo`), the next boot removes the stand-in. Under the
+privileges policy's `noNewPrivileges` it stops working, as the real sudo does.
+
+### Odd userlands
+
+| Image | Shell | What works |
+|---|---|---|
+| Debian/Ubuntu based (`node:22`, `python:3.12-slim`) | bash | Everything, as with the base image. |
+| Alpine, busybox | busybox `sh`; no bash | Everything; an exec with no command starts `sh`, and `SHELL=/bin/sh`. Use `sh -c`, not `bash -c`, in commands. alpine's busybox has no `httpd` applet. |
+| Distroless (`gcr.io/distroless/*`), scratch | none | Exec of a program by path (`/nodejs/bin/node app.js`), services, sprite URLs, the filesystem API, checkpoints. An exec with no command fails with "this sprite has no shell", one of `sh` with `executable "sh" not found in PATH`; `sprite-env` is there, but anything that needs a shell does not work. |
+
+What was verified on a real daemon (no guest network, no reflink volume):
+
+- node:22: exec as `sprite` (uid 1001, beside the image's `node`), the image's environment,
+  sudo, `sudo -u node`, a service behind the sprite URL, and a file and the service surviving
+  a warm suspend and a cold boot; spawning from inside, cached and uncached.
+- alpine:3.20: exec, home, sudo, `sprite-env`, a service behind the sprite URL (the opt-in
+  e2e test), spawning from inside.
+- python:3.12-slim and busybox:1.37: exec, the image's environment, sudo.
+- gcr.io/distroless/nodejs22-debian12: exec of `/nodejs/bin/node` as `sprite`, a file written
+  through the filesystem API run as a service behind the sprite URL, a checkpoint, and the
+  clear failures of `sh` and of an exec with no command.
+- A `localhost/` image (the base image itself): its own `sprite` account and real sudo are kept,
+  no stand-in is installed.
+
+## Disk accounting
+
+Cached disks live on the sprite volume, so the [disk guard](operations.md#disk-pressure)
+sees them: a build is refused (`507`) unless about twice the image's size (the temporary tar
+and the disk's blocks) fits above `--disk-reserve-mib`. `sandpitd status` has an `images`
+line, and its DISK/OWN columns count the blocks a sprite shares with the cached disk it came
+from once, as they do for the base image.
+
+What the guard does not cover is podman's own storage, on the filesystem of the daemon user's
+home, which holds the compressed and unpacked layers during a pull. There is no automatic
+eviction: remove what you no longer need with `sandpitd images rm`.
+
+## Not covered
+
+- The image is pulled for the host's architecture only; there is no `--platform`.
+- No pull progress through the API: a create simply blocks. `sandpitd images pull` streams it.
+- Image `HEALTHCHECK`, `STOPSIGNAL`, labels and the like are ignored.
+
+## Every disk at once (`make images`)
+
+Each API boots its sandboxes from a disk of its own in `<data>/images/`. `make deps images`
+fetches Firecracker and the guest kernel and builds them all:
+
+```sh
+make deps images                              # firecracker, kernel, base e2b vercel daytona modal
+make images VARIANTS=e2b                      # just one disk, e.g. after moving envd's pin
+make images DATA=~/.local/share/sandpit-test  # another daemon's data directory, with its own copies
+```
+
+`images` runs `scripts/fetch-deps.sh` and then `scripts/build-image.sh <variant>` for each of
+`VARIANTS`, into `DATA` when it is given on the command line (an environment variable named
+`DATA` is ignored) and the default data directory otherwise. A second daemon gets copies of
+its own, so an upgrade of one never swaps Firecracker, the kernel or a disk under the other.
+Nothing is ever built into wisp's data directory: the Makefile refuses it.
+
+What the host needs: rootless podman (each disk is a container build), `mkfs.ext4` from
+e2fsprogs, Go (for envd, built from source for the e2b disk), and network access to the
+container registries, GitHub (envd's source and Firecracker's release) and the kernel's URL.
+Each disk is 20 GB apparent and sparse (`SPRITE_DISK_GB`).
+
+## The E2B image
+
+`images/e2b/Containerfile` is a second disk image, for the E2B-compatible front-end
+([providers/e2b.md](providers/e2b.md)): E2B's in-guest daemon, **envd**, running inside a
+sandpit guest, so the official E2B SDKs talk to the real thing rather than a reimplementation.
+
+```sh
+./scripts/build-image.sh e2b      # <data>/images/e2b.ext4; base.ext4 is untouched
+```
+
+`build-image.sh e2b` first runs `scripts/build-envd.sh`, which builds envd from a pinned
+commit of [e2b-dev/infra](https://github.com/e2b-dev/infra) (`packages/envd`, Apache-2.0;
+the script checks the license and the version the binary reports) into a static binary at
+`images/e2b/envd` (git-ignored; the source is cached under `~/.cache/sandpit/e2b-infra`). The
+pin is at the top of the script: infra `92197909`, **envd 0.9.0**.
+
+What the disk contains, modelled on E2B's `base` template (`docker.io/e2bdev/base`, which
+is `python:3.11` plus Node 20, git, gh and build tools, plus what E2B's template build adds):
+
+- Ubuntu 24.04 with the base image's package set, plus `gh`, `socat` (envd's port
+  forwarder uses it), `python-is-python3` and `python3-dev`. pip installs work without a
+  venv, as on E2B (Ubuntu's PEP 668 marker is removed).
+- Node.js 22 LTS from nodejs.org (checksum-verified) with npm and corepack (`yarn`). E2B
+  ships Node 20, which is past end of life.
+- User **`user`**, uid 1000, home `/home/user`, `/bin/bash`, in `sudo` with a NOPASSWD
+  sudoers entry and no password, as on E2B. `/usr/local` and `/code` are world-writable,
+  as on E2B, so `npm i -g` and `pip install` work as `user`.
+- A `sprite` account at uid 1001 with sudo: sandpit-agent's own exec sessions and services
+  (the Sprites API, handy for debugging these sandboxes) run as `sprite`, as on any disk.
+- envd at `/usr/bin/envd` (where E2B puts it), declared as a system service in
+  `/etc/sandpit/services.d/envd.json`, below.
+
+877 MB of blocks (20 GB apparent), against 554 MB for the base image.
+
+envd runs as root with `-isnotfc -port 49983 -no-cgroups`. `-isnotfc` skips what only
+exists on E2B's Firecracker hosts (the MMDS poll for its token, the log exporter).
+`-no-cgroups` keeps envd from building its own cgroup tree (`ptys`, `socats`, `user`)
+under the cgroup root, where E2B's commands would escape the workload cgroup that carries
+the sprite's memory limit; with it, everything envd starts stays in `/sys/fs/cgroup/sprite`
+with envd. envd listens on all addresses, so sandpitd's guest port dial (which dials
+`localhost:<port>` in the guest) reaches it like any other port.
+
+envd starts unauthenticated: until something calls its `POST /init` with an access token,
+every endpoint answers anyone who can reach port 49983. The E2B front-end does that
+right after boot; see [providers/e2b.md](providers/e2b.md#envd-in-the-guest-phase-2a).
+
+### System services
+
+An image can declare daemons of its own for sandpit-agent to run, one JSON file per daemon in
+`/etc/sandpit/services.d/` (the file name, without `.json`, is the service's name; a disk
+built by wisp, with `/etc/wisp/services.d/` instead, is still read):
+
+```json
+{
+  "cmd": "/usr/bin/envd",
+  "args": ["-isnotfc", "-port", "49983", "-no-cgroups"],
+  "user": "root",
+  "env": {"GOTRACEBACK": "all"},
+  "dir": "/"
+}
+```
+
+Only `cmd` is required. `user` is an account on the disk (root when omitted); `dir`
+defaults to that user's home; the environment is the one services get (`PATH`, `HOME`,
+`USER`, the image's `ENV`) plus `env`. Unknown fields are an error, so a typo does not go
+unnoticed; a bad file is logged on the console and skipped, and the others still start.
+
+They are the image's, not the user's:
+
+- the agent starts them at every boot, before the user's services, and restarts one that
+  exits: at once after a run of 10 s or more, otherwise after 1 s, 2 s, 4 s ... up to 30 s;
+- they are not in the services API, cannot be defined, stopped or deleted through it, and
+  their starts and crashes are not service events;
+- they run under the sprite's privileges and resources policy like everything the agent
+  launches, so what they start is confined too. A policy pushed later binds processes
+  started after it, so a running daemon keeps the policy it started under until it next
+  restarts. The `minimal` profile drops `CAP_SETUID`, which envd needs to run commands as
+  `user`;
+- what they print goes to `/var/log/sandpit/services/<name>.log`, rotated like services' logs
+  (8 MiB, two rotations); pid files are in `/run/sandpit-system-services/`, which a restarted
+  agent uses to clear out a daemon its predecessor left running;
+- each runs in its own process group, as a child of `sandpit-agent serve`, never PID 1. The
+  agent reaps only the daemon itself; the daemon's children are its own, and only a
+  daemon that dies leaves them to PID 1.
+
+They are suspended and resumed with the rest of the VM, so a warm wake finds them as they
+were. A cold boot, which includes every checkpoint restore, starts them afresh.
+
+An image with no `/etc/sandpit/services.d`, such as the base image, gets nothing: no
+supervisor, no log directory, no change on its disk.
+
+## The Modal image
+
+`images/modal/Containerfile` is the disk for the Modal front-end, which is partial
+([modal-client.md](modal-client.md)). It is what `modal.Image.debian_slim()` asks for, built
+ahead of time, because the front-end does not build images. With the modal 1.6.0 client
+(image builder 2025.06) and a local Python 3.14, the client asks for
+`FROM python:3.14.2-slim-bookworm`, `apt-get install -y gcc gfortran build-essential` and
+`pip install --upgrade pip wheel uv`, and the disk has exactly that.
+
+```sh
+./scripts/build-image.sh modal    # <data>/images/modal.ext4
+```
+
+Besides debian_slim's contents, the disk has `sudo`, `procps` and `iproute2`. It also has the
+`sprite` account (uid 1000, NOPASSWD sudo) that sandpit-agent runs exec sessions as. The front-end
+runs Modal's commands as root through it. The hostname is `modal`. The disk is 594 MB of blocks
+(20 GB apparent).
+
+## The Vercel image
+
+`images/vercel/Containerfile` is the disk for the Vercel Sandbox-compatible front-end
+([vercel-sdk.md](vercel-sdk.md)), modelled on Vercel's default `universal` image (from
+[vercel/sandbox](https://github.com/vercel/sandbox)'s `images/universal` and `images/ubuntu`):
+
+```sh
+./scripts/build-image.sh vercel   # <data>/images/vercel.ext4
+```
+
+- Ubuntu 24.04 (sandpit's base; Vercel's is 26.04) with the base image's package set plus
+  `python-is-python3` and `python3-dev`; pip installs work without a venv.
+- Node.js 24 LTS from nodejs.org (checksum-verified) at `/usr/local/bin/node`, with npm and
+  corepack; `/usr/local` is world-writable so `npm i -g` works without sudo.
+- User **`ubuntu`**, uid 1000, home and working directory **`/vercel`** (Vercel's
+  `usermod --home /vercel ubuntu`), passwordless sudo, in the groups Vercel's `ubuntu` is in
+  (adm, dialout, cdrom, floppy, sudo, audio, dip, video, plugdev).
+- **`sprite` is a second name for uid 1000** (`useradd -o`), with the same home and groups,
+  listed after `ubuntu` in `/etc/passwd`. sandpit-agent runs exec sessions as the account named
+  `sprite` and hands the files its filesystem API creates to it; here that is uid 1000, which
+  `id`, `whoami`, `ls -l` and `stat` call `ubuntu` (they look the uid up, and find `ubuntu`
+  first). So Vercel's commands and files come out as Vercel's user without the agent knowing
+  anything about Vercel. The front end sets `USER`/`LOGNAME` to `ubuntu` on its commands.
+- `Defaults !use_pty` in sudoers, so `sudo` (what `sudo: true` runs a command under) keeps
+  the command's pipes instead of a pty.
+- No daemon of its own: there is nothing in `/etc/sandpit/services.d`. The front end speaks
+  Vercel's protocol on the host and drives the guest through sandpit-agent.
+
+## The Daytona image
+
+`images/daytona/Containerfile` is the disk of a Daytona sandbox, for the Daytona-compatible
+front end ([daytona-sdk.md](daytona-sdk.md)). Unlike the E2B image it has no provider daemon
+in it: Daytona's in-sandbox daemon is AGPL-licensed, so its API (the toolbox) is served by
+`sandpitd` on the host, over sandpit-agent's exec and filesystem API.
+
+```sh
+./scripts/build-image.sh daytona   # <data>/images/daytona.ext4
+```
+
+What it contains, after what the Daytona SDK's documentation describes its default sandbox as
+having:
+
+- Ubuntu 24.04 with the E2B image's package set (the same layer), and pip installs that work
+  without a venv.
+- Node.js 22 LTS from nodejs.org (checksum-verified) with npm and corepack, and TypeScript,
+  `tsx` and `ts-node` installed globally: `code_run` in a `typescript` sandbox runs `tsx`.
+- User **`daytona`**, uid 1000, home and working directory `/home/daytona`, `/bin/bash`, in
+  `sudo` with a NOPASSWD sudoers entry and no password. Hostname `daytona`.
+- `sprite` is the same account under a second name (uid 1000, home `/home/daytona`, listed after
+  `daytona` in `/etc/passwd`). sandpit-agent runs commands, and owns the files it writes, as the
+  account named `sprite`; this way they are `daytona`'s, and `whoami`, `ls -l` and `sudo` say so.
+
+About 920 MB of blocks (20 GB apparent).

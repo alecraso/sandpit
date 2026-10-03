@@ -1,0 +1,121 @@
+// sandpit-agent is the in-guest runtime. As PID 1 it sets up the system and
+// supervises a copy of itself running `serve`, which hosts the agent API on
+// vsock. Splitting the two keeps PID 1's wait4(-1) orphan reaping from
+// stealing exit statuses that os/exec is waiting on in the server.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
+
+	"github.com/arugula-salad/sandpit/internal/agent"
+)
+
+// AgentPort is the vsock port sandpitd dials.
+const AgentPort = 1024
+
+// hostAPIPort is the vsock port sandpitd answers on for this sprite (guestAPIPort there).
+const hostAPIPort = 1025
+
+func main() {
+	log.SetFlags(0)
+	log.SetPrefix("sandpit-agent: ")
+	if os.Getpid() == 1 {
+		runInit()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		serve(os.Args[2:])
+		return
+	}
+	fmt.Fprintln(os.Stderr, "usage: sandpit-agent serve [--listen vsock|tcp:ADDR|unix:PATH]")
+	os.Exit(2)
+}
+
+func dialHost(context.Context) (net.Conn, error) { return vsock.Dial(vsock.Host, hostAPIPort, nil) }
+
+func serve(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	listen := fs.String("listen", "vsock", "vsock, tcp:HOST:PORT or unix:PATH (the latter two are for host-side testing)")
+	stateDir := fs.String("state-dir", "/.sprite", "where service definitions and logs live (on the sprite's disk)")
+	runDir := fs.String("run-dir", "/run/sprite-services", "pid files; must not survive a reboot")
+	systemDir := fs.String("system-services-dir", "/etc/sandpit/services.d", "the image's own daemons, started at boot (vsock only); /etc/wisp/services.d is read when it is absent, for disks built before the rename")
+	fs.Parse(args)
+
+	var ln net.Listener
+	var err error
+	switch {
+	case *listen == "vsock":
+		ln, err = vsock.Listen(AgentPort, nil)
+	case strings.HasPrefix(*listen, "tcp:"):
+		ln, err = net.Listen("tcp", strings.TrimPrefix(*listen, "tcp:"))
+	case strings.HasPrefix(*listen, "unix:"):
+		ln, err = net.Listen("unix", strings.TrimPrefix(*listen, "unix:"))
+	default:
+		log.Fatalf("bad --listen %q", *listen)
+	}
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+
+	// Before the supervisor exists: it starts services, and they must be confined too.
+	boot := cmdline()
+	memLimit, _ := strconv.Atoi(boot["memlimit"])
+	agent.InitPolicy(agent.Policy{Profile: boot["profile"], NoNewPrivs: boot["nnp"] == "1", MemoryLimitMB: memLimit},
+		"/run/sprite-policy.json")
+
+	// The image's own daemons (E2B's envd, say), not the user's: they are
+	// started here and are nowhere in the services API. Only in a real guest: on
+	// the host these paths would name the host's files.
+	if *listen == "vsock" {
+		dir := *systemDir
+		if _, err := os.Stat(dir); os.IsNotExist(err) && dir == "/etc/sandpit/services.d" {
+			dir = "/etc/wisp/services.d" // a disk built by wisp
+		}
+		agent.NewSystemSupervisor(dir, "/var/log/sandpit/services", "/run/sandpit-system-services")
+	}
+
+	// Service starts and crashes go to sandpitd's event stream, which only exists over vsock.
+	var report func(agent.ServiceReport)
+	if *listen == "vsock" {
+		report = agent.NewReporter(dialHost).Report
+	}
+	srv := &agent.Server{
+		Sessions: agent.NewManager(),
+		StateDir: *stateDir,
+		Services: agent.NewReportingSupervisor(*stateDir, *runDir, report),
+		Poweroff: func() {
+			unix.Sync()
+			// With reboot=k on the kernel command line this resets via the
+			// keyboard controller, which makes Firecracker exit cleanly.
+			if err := unix.Reboot(unix.LINUX_REBOOT_CMD_RESTART); err != nil {
+				log.Printf("reboot: %v", err)
+			}
+		},
+	}
+	// The in-guest API needs the host channel, which only exists over vsock.
+	if *listen == "vsock" {
+		sock := filepath.Join(*stateDir, "api.sock")
+		if gl, err := agent.ListenGuestAPI(sock); err != nil {
+			log.Printf("%s: %v", sock, err)
+		} else {
+			gs := &http.Server{Handler: srv.GuestAPI(dialHost), ReadHeaderTimeout: 10 * time.Second}
+			go func() { log.Fatal(gs.Serve(gl)) }()
+		}
+	}
+	log.Printf("serving on %s", *listen)
+	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	log.Fatal(hs.Serve(ln))
+}

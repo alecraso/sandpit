@@ -1,0 +1,388 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/arugula-salad/sandpit/engine"
+	"github.com/arugula-salad/sandpit/internal/confine"
+	"github.com/arugula-salad/sandpit/internal/netd"
+	"github.com/arugula-salad/sandpit/internal/store"
+	"github.com/arugula-salad/sandpit/internal/vmm"
+)
+
+// The operator's view of one host (`sandpitd status`). A running daemon serves
+// it on a unix socket in the data directory, where the filesystem permission is
+// the authentication; with no daemon up, OfflineStatus answers from the files.
+// The JSON field names are an interface: scripts read them.
+
+// StatusSocket is the socket's name inside the data directory.
+const StatusSocket = "sandpitd.sock"
+
+type Status struct {
+	// Daemon is nil when the answer was read from the files, with no daemon running.
+	Daemon  *DaemonStatus  `json:"daemon"`
+	Host    HostStatus     `json:"host"`
+	Sprites []SpriteStatus `json:"sprites"`
+	// Orphans are Firecracker processes of this user that no running sandpitd
+	// is the parent of. They are reported, never killed: another data directory
+	// or somebody's experiment may own them.
+	Orphans []VMProcess `json:"orphans"`
+	// OtherDaemons are sandpitd processes of this user besides the one answering.
+	OtherDaemons []OtherDaemon `json:"other_daemons"`
+}
+
+type DaemonStatus struct {
+	Pid       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	Listen    string    `json:"listen"`
+}
+
+type HostStatus struct {
+	DataDir string          `json:"data_dir"`
+	Volume  engine.Headroom `json:"volume"`
+	// Reflink says whether clones on the sprite volume are copy-on-write.
+	Reflink bool `json:"reflink"`
+	// DiskReserve is what creates and checkpoints must leave free (daemon only).
+	DiskReserve int64 `json:"disk_reserve_bytes"`
+	// Networking is false for a daemon run with --net=false or without the bridge.
+	Networking bool `json:"networking"`
+	// Bridge is the network pool's bridge the daemon uses or looked for (daemon only).
+	Bridge    string `json:"bridge,omitempty"`
+	TapsTotal int    `json:"taps_total"`
+	TapsUsed  int    `json:"taps_used"`
+	// PolicyHelper is sandpit-netd, without which restrictive network policies are refused.
+	PolicyHelper engine.HelperStatus `json:"policy_helper"`
+	Running      int                 `json:"running"`
+	Warm         int                 `json:"warm"`
+	Cold         int                 `json:"cold"`
+	// Limits of 0 mean none is configured.
+	MaxRunning int `json:"max_running"`
+	MaxSprites int `json:"max_sprites"`
+	// The host admission budget (engine/admission.go), daemon only. ReservedMemoryMiB is
+	// the guest RAM running and starting VMs hold against MaxRunningMemoryMiB:
+	// their ceilings, not what they are touching, and reported even with no
+	// budget set so an operator can see what one would have to be.
+	MaxRunningMemoryMiB int `json:"max_running_memory_mib"`
+	ReservedMemoryMiB   int `json:"reserved_memory_mib"`
+	MaxConcurrentBoots  int `json:"max_concurrent_boots"`
+	BootsInFlight       int `json:"boots_in_flight"`
+	// Images is the cache of disks built from container images (engine/images.go).
+	Images ImageCacheStatus `json:"images"`
+	// Cgroup is the subtree every VM's cgroup sits in, with its caps
+	// (--cgroup-memory-max, --cgroup-cpu-weight); daemon only, absent without one.
+	Cgroup *confine.SubtreeStatus `json:"cgroup,omitempty"`
+}
+
+type ImageCacheStatus struct {
+	Count int `json:"count"`
+	// Bytes is what the cached disks occupy on the sprite volume.
+	Bytes int64 `json:"bytes"`
+}
+
+func imageCacheStatus(vmRoot string) ImageCacheStatus {
+	var st ImageCacheStatus
+	st.Count, st.Bytes = engine.ImageCacheUsage(vmRoot)
+	return st
+}
+
+type SpriteStatus struct {
+	Name  string `json:"name"`
+	ID    string `json:"id"`
+	State string `json:"state"` // running, warm or cold
+	// Busy marks a sprite in the middle of a transition (booting, suspending,
+	// checkpointing); what could not be read without waiting for it is left out.
+	Busy   bool  `json:"busy,omitempty"`
+	VMMPid int   `json:"vmm_pid,omitempty"`
+	VMMRSS int64 `json:"vmm_rss_bytes,omitempty"`
+	// DiskApparent is the size the guest sees. DiskUsed is what the sprite's disk
+	// and checkpoints occupy, each shared block counted once; DiskExclusive is the
+	// part nothing else on the volume shares, i.e. what deleting the sprite frees.
+	DiskApparent  int64 `json:"disk_apparent_bytes"`
+	DiskUsed      int64 `json:"disk_used_bytes"`
+	DiskExclusive int64 `json:"disk_exclusive_bytes"`
+	// SnapshotBytes is the memory snapshot of a warm sprite.
+	SnapshotBytes int64 `json:"snapshot_bytes"`
+	Checkpoints   int   `json:"checkpoints"`
+	// MountedCheckpoints maps a checkpoint slot to the checkpoint mounted in it.
+	MountedCheckpoints map[int]string `json:"mounted_checkpoints,omitempty"`
+	// TaskHolds counts live tasks keeping the sprite awake; nil when the guest was not asked.
+	TaskHolds   *int   `json:"task_holds"`
+	APIInflight int    `json:"api_inflight"`
+	NetIndex    int    `json:"net_index"`
+	IP          string `json:"ip,omitempty"`
+	Tap         string `json:"tap,omitempty"`
+	// PolicyRestricted says the sprite's egress goes through the policy enforcer.
+	PolicyRestricted bool       `json:"policy_restricted"`
+	LastRunningAt    *time.Time `json:"last_running_at,omitempty"`
+	LastWarmingAt    *time.Time `json:"last_warming_at,omitempty"`
+	// Image is the container image the disk was made from, if any.
+	Image string `json:"image,omitempty"`
+	// ExpiresAt is the workspace lease: when this sprite is deleted, disk and
+	// all (engine/leases.go). Absent on a sprite with no lease, which is the default.
+	// Protected holds the deletion off without clearing the deadline, so an
+	// operator can see both that the lease ran out and why the sprite is still here.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Protected bool       `json:"protected,omitempty"`
+}
+
+type VMProcess struct {
+	Pid int    `json:"pid"`
+	Cwd string `json:"cwd"`
+	RSS int64  `json:"rss_bytes"`
+	// Parent is what the process hangs off now: init or a systemd user manager
+	// once its starter died, otherwise whatever started it by hand.
+	ParentPid  int    `json:"parent_pid"`
+	ParentName string `json:"parent_name"`
+	// InDataDir marks a VM inside this data directory: left by a sandpitd that
+	// died, and reaped by the next one to start.
+	InDataDir bool `json:"in_data_dir"`
+}
+
+type OtherDaemon struct {
+	Pid int      `json:"pid"`
+	Cmd []string `json:"cmd"`
+	Cwd string   `json:"cwd"`
+	VMs int      `json:"vms"`
+}
+
+type proc struct {
+	pid, ppid int
+	exe, cwd  string
+	rss       int64
+	cpuTicks  int64 // utime + stime, in clock ticks
+}
+
+func readProc(pid int) (p proc, ok bool) {
+	dir := "/proc/" + strconv.Itoa(pid)
+	b, err := os.ReadFile(dir + "/stat")
+	if err != nil {
+		return p, false
+	}
+	// "pid (comm) state ppid ...": comm may hold spaces and parentheses, so cut at the last one.
+	i := strings.LastIndex(string(b), ") ")
+	if i < 0 {
+		return p, false
+	}
+	f := strings.Fields(string(b)[i+2:])
+	if len(f) < 22 {
+		return p, false
+	}
+	p.pid = pid
+	p.ppid, _ = strconv.Atoi(f[1])
+	pages, _ := strconv.ParseInt(f[21], 10, 64)
+	p.rss = pages * int64(os.Getpagesize())
+	ut, _ := strconv.ParseInt(f[11], 10, 64)
+	st, _ := strconv.ParseInt(f[12], 10, 64)
+	p.cpuTicks = ut + st
+	p.exe, _ = os.Readlink(dir + "/exe")
+	p.cwd, _ = os.Readlink(dir + "/cwd")
+	return p, true
+}
+
+func procName(pid int) string {
+	b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+	return strings.TrimSpace(string(b))
+}
+
+// isDaemonExe says a process runs one of the daemons that start Firecrackers
+// here: sandpitd, or wisp's wispd and sandboxd, which share hosts with it.
+func isDaemonExe(path string) bool {
+	return isExe(path, "sandpitd") || isExe(path, "wispd") || isExe(path, "sandboxd")
+}
+
+// isExe tolerates the " (deleted)" suffix of a binary rebuilt under a running process.
+func isExe(path, name string) bool {
+	return filepath.Base(strings.TrimSuffix(path, " (deleted)")) == name
+}
+
+// scanProcs sorts this user's Firecrackers into orphans and other daemons'
+// VMs. self is the answering daemon's pid, whose own VMs are neither (0 offline).
+func scanProcs(vmRoot string, self int) (orphans []VMProcess, others []OtherDaemon) {
+	orphans, others = []VMProcess{}, []OtherDaemon{}
+	entries, _ := os.ReadDir("/proc")
+	uid := uint32(os.Getuid())
+	daemons := map[int]*OtherDaemon{}
+	var vms []proc
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		var st syscall.Stat_t
+		if syscall.Stat("/proc/"+e.Name(), &st) != nil || st.Uid != uid {
+			continue
+		}
+		p, ok := readProc(pid)
+		switch {
+		case !ok:
+		case isExe(p.exe, "firecracker"):
+			vms = append(vms, p)
+		case isDaemonExe(p.exe) && pid != self && pid != os.Getpid():
+			b, _ := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+			cmd := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+			// `sandpitd status` and friends are not daemons.
+			if len(cmd) > 1 && !strings.HasPrefix(cmd[1], "-") {
+				continue
+			}
+			daemons[pid] = &OtherDaemon{Pid: pid, Cmd: cmd, Cwd: p.cwd}
+		}
+	}
+	for _, p := range vms {
+		if p.ppid == self && self != 0 {
+			continue
+		}
+		if d, ok := daemons[p.ppid]; ok {
+			d.VMs++
+			continue
+		}
+		orphans = append(orphans, VMProcess{Pid: p.pid, Cwd: p.cwd, RSS: p.rss, ParentPid: p.ppid, ParentName: procName(p.ppid),
+			InDataDir: strings.HasPrefix(p.cwd, vmRoot+"/")})
+	}
+	for _, d := range daemons {
+		others = append(others, *d)
+	}
+	return orphans, others
+}
+
+// diskUsage fills in the disk figures of every sprite at once (engine.MeasureDisks).
+func diskUsage(st *store.Store, vmRoot string, sprites []SpriteStatus) {
+	ids := make([]string, len(sprites))
+	for i := range sprites {
+		ids[i] = sprites[i].ID
+	}
+	for i, u := range engine.MeasureDisks(st, vmRoot, ids) {
+		sprites[i].DiskApparent, sprites[i].DiskUsed, sprites[i].DiskExclusive = u.Apparent, u.Used, u.Exclusive
+		sprites[i].SnapshotBytes = u.Snapshot
+	}
+}
+
+func spriteBase(sp store.Sprite) SpriteStatus {
+	return SpriteStatus{Name: sp.Name, ID: sp.ID, Checkpoints: len(sp.Checkpoints), MountedCheckpoints: sp.Mounts,
+		NetIndex: sp.NetIndex, LastRunningAt: sp.LastRunningAt, LastWarmingAt: sp.LastWarmingAt, Image: sp.Image,
+		ExpiresAt: sp.ExpiresAt, Protected: sp.Protected}
+}
+
+func (h *HostStatus) count(state string) {
+	switch state {
+	case "running":
+		h.Running++
+	case "warm":
+		h.Warm++
+	default:
+		h.Cold++
+	}
+}
+
+// OfflineStatus is the answer when no daemon is running on dataDir: everything
+// the files and /proc can tell. A sprite can only be warm or cold then; a VM
+// still alive in its directory shows up among the orphans.
+func OfflineStatus(dataDir, netdSocket string) (Status, error) {
+	vmRoot := filepath.Join(dataDir, "vm")
+	if _, err := os.Stat(vmRoot); err != nil {
+		return Status{}, fmt.Errorf("no sprite directory at %s (is --data right?)", vmRoot)
+	}
+	st, err := store.Open(dataDir)
+	if err != nil {
+		return Status{}, err
+	}
+	out := Status{Host: HostStatus{DataDir: dataDir, Reflink: engine.ProbeReflink(vmRoot)}, Sprites: []SpriteStatus{}}
+	out.Host.Volume, _ = engine.ProbeHeadroom(vmRoot)
+	out.Host.Images = imageCacheStatus(vmRoot)
+	if netdSocket == "" {
+		netdSocket = netd.Pool(0).Socket()
+	}
+	// Connecting would make the helper log a refused request, so only look.
+	if fi, err := os.Stat(netdSocket); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		out.Host.PolicyHelper = engine.HelperStatus{Reachable: true, Detail: "socket present at " + netdSocket + "; not probed without a daemon"}
+	} else {
+		out.Host.PolicyHelper.Detail = "no socket at " + netdSocket
+	}
+	for _, sp := range st.List(store.Sprites, "") {
+		s := spriteBase(sp)
+		s.State = "cold"
+		if vmm.HasSnapshot(st.Dir(sp.ID)) {
+			s.State = "warm"
+		}
+		s.PolicyRestricted = len(sp.NetworkRules) > 0 // the daemon knows better: it compiles the rules
+		out.Host.count(s.State)
+		out.Sprites = append(out.Sprites, s)
+	}
+	diskUsage(st, vmRoot, out.Sprites)
+	out.Orphans, out.OtherDaemons = scanProcs(vmRoot, 0)
+	return out, nil
+}
+
+// status is the live view.
+func (s *Server) status(ctx context.Context, started time.Time, listen string) Status {
+	l := s.life
+	vmRoot := filepath.Join(s.opts.DataDir, "vm")
+	out := Status{Daemon: &DaemonStatus{Pid: os.Getpid(), StartedAt: started, Listen: listen},
+		Host: HostStatus{DataDir: s.opts.DataDir, Reflink: l.Reflink(), DiskReserve: s.opts.DiskReserve,
+			Networking: l.Networking(), Bridge: netd.Pool(s.opts.NetPool).Bridge(), PolicyHelper: l.PolicyHelper(),
+			MaxRunning: s.opts.MaxRunning, MaxSprites: s.opts.MaxSprites,
+			MaxRunningMemoryMiB: s.opts.MaxRunningMemoryMiB, MaxConcurrentBoots: s.opts.MaxConcurrentBoots},
+		Sprites: []SpriteStatus{}}
+	out.Host.ReservedMemoryMiB, out.Host.BootsInFlight = l.AdmissionUsage()
+	out.Host.Volume, _ = l.Volume()
+	out.Host.Images = imageCacheStatus(vmRoot)
+	out.Host.TapsTotal, out.Host.TapsUsed = l.TapUsage()
+	out.Host.Cgroup = s.opts.Host.Confine.Subtree()
+
+	var wg sync.WaitGroup
+	sprites := s.store.List(store.Sprites, "")
+	out.Sprites = make([]SpriteStatus, len(sprites))
+	for i, sp := range sprites {
+		st := spriteBase(sp)
+		st.State = l.Status(sp.Record)
+		st.PolicyRestricted = l.PolicyRestricted(sp.Record)
+		if ip := l.SandboxIP(sp.Record); ip != nil {
+			st.IP = ip.String()
+		}
+		vm := l.Peek(sp.ID)
+		st.APIInflight = vm.Inflight
+		st.Busy, st.Tap = vm.Busy, vm.Tap
+		out.Host.count(st.State)
+		out.Sprites[i] = st
+		if vm.Running() {
+			out.Sprites[i].VMMPid = vm.Pid
+			if p, ok := readProc(vm.Pid); ok {
+				out.Sprites[i].VMMRSS = p.rss
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cctx, cancel := context.WithTimeout(ctx, time.Second)
+				defer cancel()
+				if tasks, ok := vm.TaskHolds(cctx); ok {
+					out.Sprites[i].TaskHolds = &tasks
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	diskUsage(s.store, vmRoot, out.Sprites)
+	out.Orphans, out.OtherDaemons = scanProcs(vmRoot, os.Getpid())
+	return out
+}
+
+// StatusHandler serves the operator socket. It carries no token check: whoever
+// can open the socket can already read the token file beside it.
+func (s *Server) StatusHandler(listen string) http.Handler {
+	started := time.Now()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.status(r.Context(), started, listen))
+	})
+	s.registerImageOps(mux)
+	s.registerKeyOps(mux, "")
+	return mux
+}

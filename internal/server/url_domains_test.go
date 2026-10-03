@@ -1,0 +1,268 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// A host serving two URL domains: widgets.test (the default) and arugula.test.
+func twoDomainServer(t *testing.T) (*Server, http.Handler) {
+	t.Helper()
+	s, h := newOperatorServer(t, Options{})
+	s.urlDomains = []string{"widgets.test", "arugula.test"}
+	s.urlFmt = "https://%s.%s"
+	return s, h
+}
+
+func rendered(t *testing.T, body []byte) spriteJSON {
+	t.Helper()
+	var sp spriteJSON
+	if err := json.Unmarshal(body, &sp); err != nil {
+		t.Fatal(err)
+	}
+	return sp
+}
+
+func TestASpriteIsCreatedUnderTheURLDomainItAsksFor(t *testing.T) {
+	_, h := twoDomainServer(t)
+	plain := rendered(t, status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"plain"}`), http.StatusCreated))
+	if plain.URL != "https://plain.widgets.test" || plain.URLDomain != "widgets.test" {
+		t.Errorf("default: url %q, url_domain %q", plain.URL, plain.URLDomain)
+	}
+	other := rendered(t, status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"studio","url_domain":"Arugula.Test."}`), http.StatusCreated))
+	if other.URL != "https://studio.arugula.test" || other.URLDomain != "arugula.test" {
+		t.Errorf("chosen: url %q, url_domain %q", other.URL, other.URLDomain)
+	}
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"lost","url_domain":"evil.example"}`), http.StatusBadRequest)
+}
+
+// A sprite answers only under its own domain, so the same name under the
+// other domain is not its URL.
+func TestASpriteAnswersOnlyUnderItsOwnURLDomain(t *testing.T) {
+	s, h := twoDomainServer(t)
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"old"}`), http.StatusCreated)
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"new","url_domain":"arugula.test"}`), http.StatusCreated)
+	for host, want := range map[string]bool{
+		"old.widgets.test": true, "old.arugula.test": false,
+		"new.arugula.test": true, "new.widgets.test": false,
+		"new.arugula.test:443": true, "a.new.arugula.test": false, "arugula.test": false,
+	} {
+		if _, ok := s.spriteForHost(host); ok != want {
+			t.Errorf("%s: served = %v, want %v", host, ok, want)
+		}
+	}
+}
+
+func TestASpriteMadeFromInsideIsUnderItsParentsURLDomain(t *testing.T) {
+	s, h := twoDomainServer(t)
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"studio","url_domain":"arugula.test"}`), http.StatusCreated)
+	status(t, apiCall(t, h, "POST", "/v1/sprites/studio/policy/spawn", `{"enabled":true,"max_children":2}`), http.StatusNoContent)
+	// It cannot choose another: its apps are on its domain.
+	app := rendered(t, status(t, fromInside(t, s, "studio", "POST", "/v1/sprites", `{"name":"app-1","url_domain":"widgets.test"}`), http.StatusCreated))
+	if app.URL != "https://app-1.arugula.test" {
+		t.Errorf("child url %q", app.URL)
+	}
+}
+
+func TestCustomDomainsCannotBeUnderAnyURLDomain(t *testing.T) {
+	s := &Server{urlDomains: []string{"widgets.test", "arugula.test"}}
+	for _, d := range []string{"x.widgets.test", "arugula.test", "deep.x.arugula.test"} {
+		if err := s.validDomain(d); err == nil {
+			t.Errorf("%s was accepted", d)
+		}
+	}
+	if err := s.validDomain("game.example.com"); err != nil {
+		t.Errorf("game.example.com: %v", err)
+	}
+}
+
+// games.arugula.test is nested in arugula.test: a host belongs to the most
+// specific domain it is strictly under, and the nested domain's own name is
+// still the outer domain's sprite of that name.
+func TestNestedURLDomainsGoToTheMostSpecific(t *testing.T) {
+	s, h := newOperatorServer(t, Options{})
+	s.urlDomains = []string{"widgets.test", "arugula.test", "games.arugula.test"}
+	s.urlFmt = "https://%s.%s"
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"games","url_domain":"arugula.test"}`), http.StatusCreated)
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"studio","url_domain":"arugula.test"}`), http.StatusCreated)
+	g := rendered(t, status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"game-1","url_domain":"games.arugula.test"}`), http.StatusCreated))
+	if g.URL != "https://game-1.games.arugula.test" || g.URLDomain != "games.arugula.test" {
+		t.Errorf("nested: url %q, url_domain %q", g.URL, g.URLDomain)
+	}
+	for host, want := range map[string]string{
+		"game-1.games.arugula.test": "game-1",
+		"games.arugula.test":        "games",
+		"studio.arugula.test":       "studio",
+		"game-1.arugula.test":       "", // not its domain
+		"studio.games.arugula.test": "", // not its domain
+		"a.b.games.arugula.test":    "",
+	} {
+		name, ok := s.spriteForHost(host)
+		if (want != "") != ok || name != want && want != "" {
+			t.Errorf("%s: got %q, %v; want %q", host, name, ok, want)
+		}
+	}
+	for host, want := range map[string]string{"x.games.arugula.test": "games.arugula.test", "games.arugula.test": "arugula.test", "x.arugula.test": "arugula.test", "arugula.test": ""} {
+		if got, _ := URLDomainUnder(s.urlDomains, host); got != want {
+			t.Errorf("URLDomainUnder(%s) = %q, want %q", host, got, want)
+		}
+	}
+	if err := s.validDomain("x.games.arugula.test"); err == nil {
+		t.Error("a custom domain under the nested URL domain was accepted")
+	}
+}
+
+// A sprite can be moved to another URL domain from outside: same sprite, a new
+// URL, and the old one stops answering.
+func TestASpriteCanMoveToAnotherURLDomain(t *testing.T) {
+	s, h := twoDomainServer(t)
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"game-1","url_domain":"widgets.test"}`), http.StatusCreated)
+	moved := rendered(t, status(t, apiCall(t, h, "PUT", "/v1/sprites/game-1", `{"url_domain":"Arugula.Test."}`), http.StatusOK))
+	if moved.URL != "https://game-1.arugula.test" || moved.URLDomain != "arugula.test" {
+		t.Errorf("moved: url %q, url_domain %q", moved.URL, moved.URLDomain)
+	}
+	if _, ok := s.spriteForHost("game-1.widgets.test"); ok {
+		t.Error("the old URL still answers")
+	}
+	if name, ok := s.spriteForHost("game-1.arugula.test"); !ok || name != "game-1" {
+		t.Errorf("the new URL: %q, %v", name, ok)
+	}
+	status(t, apiCall(t, h, "PUT", "/v1/sprites/game-1", `{"url_domain":"evil.example"}`), http.StatusBadRequest)
+	// Leaving it out changes nothing.
+	same := rendered(t, status(t, apiCall(t, h, "PUT", "/v1/sprites/game-1", `{"labels":["x"]}`), http.StatusOK))
+	if same.URLDomain != "arugula.test" {
+		t.Errorf("a labels-only update moved it to %q", same.URLDomain)
+	}
+}
+
+// A reverse proxy may serve the API under a name inside a URL domain
+// (sandpit.widgets.test). That name is the bearer API, not sprite "sandpit", and
+// not the dashboard either.
+func TestAPIHostsAreNeverSpriteURLs(t *testing.T) {
+	s, h := newOperatorServer(t, Options{APIHosts: []string{"api.widgets.test"}})
+	s.urlDomains = []string{"widgets.test"}
+	for host, want := range map[string]bool{
+		"api.widgets.test": false, "API.widgets.test.": false, "api.widgets.test:443": false,
+		"game-1.widgets.test": true,
+	} {
+		if _, ok := s.spriteForHost(host); ok != want {
+			t.Errorf("%s: served as a sprite = %v, want %v", host, ok, want)
+		}
+	}
+	for _, path := range []string{"/", "/ui/", "/ui/api/status"} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Host = "api.widgets.test"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" {
+			t.Errorf("GET %s on the API host: %d, want a bearer challenge", path, rec.Code)
+		}
+	}
+	req := httptest.NewRequest("GET", "/v1/sprites", nil)
+	req.Host = "api.widgets.test"
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /v1/sprites with the token on the API host: %d", rec.Code)
+	}
+}
+
+// --api-listen serves the bearer API whatever the Host: a proxy that rewrites
+// it, or a request naming a sprite or the dashboard, still reaches neither,
+// and the dashboard's cookie is no token there.
+func TestBearerHandlerIsTheAPIAlone(t *testing.T) {
+	s, h := newOperatorServer(t, Options{})
+	s.urlDomains = []string{"widgets.test"}
+	bearerOnly := s.BearerHandler()
+	cookie := uiLogin(t, h)
+	for _, host := range []string{"127.0.0.1:7789", "game-1.widgets.test", "anything.example"} {
+		for _, path := range []string{"/", "/ui/", "/ui/api/status", "/v1/sprites"} {
+			resp := uiCall(bearerOnly, "GET", path, "", func(r *http.Request) {
+				r.Host = host
+				r.AddCookie(cookie)
+				r.Header.Set(uiHeader, "1")
+			})
+			if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("WWW-Authenticate") == "" {
+				t.Errorf("GET %s%s with the dashboard cookie: %s, want a bearer challenge", host, path, resp.Status)
+			}
+		}
+		resp := uiCall(bearerOnly, "GET", "/v1/sprites", "", func(r *http.Request) {
+			r.Host = host
+			r.Header.Set("Authorization", "Bearer tok")
+		})
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Sprite-Version") == "" {
+			t.Errorf("GET %s/v1/sprites with the token: %s", host, resp.Status)
+		}
+	}
+	// The same cookie still works on the API listener proper.
+	resp := uiCall(h, "GET", "/v1/sprites", "", func(r *http.Request) {
+		r.AddCookie(cookie)
+		r.Header.Set(uiHeader, "1")
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("dashboard cookie on --listen: %s", resp.Status)
+	}
+}
+
+// Behind sandpitd's --sprites-public-url the API host is the URL domain
+// itself: sprites.example.test is the bearer API, <name>.sprites.example.test
+// a sprite, and a sprite URL, which reaches the public through the proxy, is
+// told no more than --public-listen tells.
+func TestProxiedSpritesAPIAndURLsShareOneName(t *testing.T) {
+	s, h := newOperatorServer(t, Options{APIHosts: []string{"sprites.example.test"}, URLsProxied: true})
+	s.urlDomains = []string{"sprites.example.test"}
+	for host, want := range map[string]bool{
+		"sprites.example.test": false, "game-1.sprites.example.test": true, "a.b.sprites.example.test": false,
+	} {
+		if _, ok := s.spriteForHost(host); ok != want {
+			t.Errorf("%s: served as a sprite = %v, want %v", host, ok, want)
+		}
+	}
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "sprites.example.test"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("the dashboard on the API host: %d, want 401", rec.Code)
+	}
+
+	status(t, apiCall(t, h, "POST", "/v1/sprites", `{"name":"game","url_settings":{"auth":"public"}}`), http.StatusCreated)
+	req = httptest.NewRequest("GET", "/", nil)
+	req.Host = "game.sprites.example.test"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req) // no Firecracker here, so the wake fails
+	if rec.Code != http.StatusServiceUnavailable || strings.TrimSpace(rec.Body.String()) != "sprite failed to wake" {
+		t.Errorf("a failed wake through the proxy: %d %q, want 503 and no detail", rec.Code, rec.Body.String())
+	}
+}
+
+// GET /healthz answers without a token on the API listener, under an API
+// host and on --api-listen, as on every other front end; a sprite URL's
+// /healthz is the sprite's.
+func TestHealthzNeedsNoToken(t *testing.T) {
+	s, h := newOperatorServer(t, Options{APIHosts: []string{"sprites.example.test"}})
+	s.urlDomains = []string{"sprites.example.test"}
+	for _, c := range []struct {
+		h    http.Handler
+		host string
+	}{{h, "127.0.0.1:7790"}, {h, "sprites.example.test"}, {s.BearerHandler(), "anything.example"}} {
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		req.Host = c.host
+		rec := httptest.NewRecorder()
+		c.h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+			t.Errorf("GET %s/healthz: %d %q", c.host, rec.Code, rec.Body.String())
+		}
+	}
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	req.Host = "nosuch.sprites.example.test"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /healthz on a sprite URL: %d, want the sprite's answer (404, no such sprite)", rec.Code)
+	}
+}
