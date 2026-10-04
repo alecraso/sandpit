@@ -295,6 +295,9 @@ install_line=$(grep -nxF -- "./scripts/install-service.sh --name sandpit --data 
 out=$(mk install-service NAME=sandboxd DATA=/bulk/sandboxd TAKEOVER=1 FLAGS='--listen 127.0.0.1:7910')
 grep -qxF -- "./scripts/install-service.sh --name sandboxd --data /bulk/sandboxd --takeover -- --listen 127.0.0.1:7910" <<<"$out" \
   && pass "make install-service NAME= DATA= TAKEOVER=1 FLAGS= passes them on" || { fail "make install-service with args:"; echo "$out"; }
+out=$(mk install-service DATA=/srv/sandpit/data FORCE_PAIR=1)
+grep -qxF -- "./scripts/install-service.sh --name sandpit --data /srv/sandpit/data --force-pair" <<<"$out" \
+  && pass "make install-service FORCE_PAIR=1 passes --force-pair" || { fail "make install-service FORCE_PAIR=1:"; echo "$out"; }
 env -u SANDPIT_DATA -u XDG_DATA_HOME -u MAKEFLAGS -u MAKELEVEL -u MFLAGS NAME=somehost DATA=/data FLAGS=-x HOME="$H" make -s -n -C "$SRC" install-service 2>&1 | grep -qxF -- "./scripts/install-service.sh --name sandpit --data $H/.local/share/sandpit" \
   && pass "make install-service ignores NAME/DATA/FLAGS from the environment" || fail "make install-service tripped on environment NAME/DATA/FLAGS"
 for t in install-service initrd images; do

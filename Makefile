@@ -55,9 +55,11 @@ run: build initrd
 # on DATA (default $(SANDPIT_DATA)). The checks run before the initrd is built
 # into DATA, so a refused install writes nothing there. TAKEOVER=1 replaces a
 # unit of the same NAME running wisp's sandboxd on the same DATA (see
-# scripts/install-service.sh --takeover).
-INSTALL_ARGS = --name $(NAME) --data $(SANDPIT_DATA)$(if $(TAKEOVER), --takeover)$(if $(FLAGS), -- $(FLAGS))
-install-service: build   ## [NAME=sandpit] [DATA=<dir>] [FLAGS='--e2b-listen ...'] [TAKEOVER=1]
+# scripts/install-service.sh --takeover). FORCE_PAIR=1 lets the default name
+# run on another data directory (a host whose data lives on its own volume), or
+# another name on the default one (--force-pair).
+INSTALL_ARGS = --name $(NAME) --data $(SANDPIT_DATA)$(if $(TAKEOVER), --takeover)$(if $(FORCE_PAIR), --force-pair)$(if $(FLAGS), -- $(FLAGS))
+install-service: build   ## [NAME=sandpit] [DATA=<dir>] [FLAGS='--e2b-listen ...'] [TAKEOVER=1] [FORCE_PAIR=1]
 	./scripts/install-service.sh --check $(INSTALL_ARGS)
 	./scripts/build-initrd.sh
 	./scripts/install-service.sh $(INSTALL_ARGS)

@@ -8,6 +8,7 @@ back after a reboot, like the network and the volume already do:
 ```sh
 make install-service                       # builds, installs a systemd *user* unit, (re)starts it
 make install-service FLAGS='--e2b-listen 127.0.0.1:7901 --max-running 8'   # with sandpitd flags
+make install-service DATA=/srv/sandpit/data FORCE_PAIR=1   # the one install, its data on a volume of its own
 ./scripts/install-service.sh --uninstall   # suspends the sprites and removes the unit; data stays
 ```
 
