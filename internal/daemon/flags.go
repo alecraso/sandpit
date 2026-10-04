@@ -130,12 +130,21 @@ func Bind(fs *flag.FlagSet) (finish func() (server.Options, *Flags)) {
 // to --listen with the Host intact (sandpitd's --sprites-public-url). u's host
 // becomes an --api-host, the bearer API alone, and the one URL domain: sprite
 // URLs are <scheme>://<name>.<u's host>, served on --listen and told no more
-// than --public-listen would tell. It replaces --url-domain and --public-listen,
-// which the caller must refuse beside it. u is http(s)://host[:port] and nothing
+// than --public-listen would tell. It replaces --public-listen, which the
+// caller must refuse beside it. u is http(s)://host[:port] and nothing
 // else.
-func (f *Flags) BehindProxy(opts *server.Options, u *url.URL) {
+//
+// extraDomains, when --url-domain was given beside it, are further URL domains
+// behind the same proxy: sprites under them keep those names (a sprite moved
+// here from another host, say), reported with u's scheme. u's host stays the
+// default for new sprites.
+func (f *Flags) BehindProxy(opts *server.Options, u *url.URL, extraDomains bool) {
 	f.proxied = u
-	f.urlDomain = u.Hostname()
+	if extraDomains {
+		f.urlDomain = u.Hostname() + "," + f.urlDomain
+	} else {
+		f.urlDomain = u.Hostname()
+	}
 	opts.APIHosts = append(opts.APIHosts, parseHosts(u.Hostname())...)
 	opts.URLsProxied = true
 }

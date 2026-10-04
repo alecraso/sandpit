@@ -89,7 +89,7 @@ func main() {
 	daytonaURL := flag.String("daytona-url", "", "how Daytona clients reach --daytona-listen (e.g. https://daytona.example.com), for the toolbox URL sandboxes report; default: --daytona-public-url, else the Host each request came to")
 	e2bPublic := flag.String("e2b-public-url", "", "the public URL of --e2b-listen behind a proxy (e.g. https://e2b.example.com): sandboxes report its host as their domain, port and all, instead of --e2b-domain with the listen port")
 	vercelPublic := flag.String("vercel-public-url", "", "the public URL of --vercel-listen behind a proxy (e.g. https://vercel.example.com): routes are <scheme>://<subdomain>.<its host>, instead of http:// under --vercel-domain with the listen port")
-	spritesPublic := flag.String("sprites-public-url", "", "the public URL of --listen behind a proxy that forwards that host and every name under it (e.g. https://sprites.example.com): the Sprites API is served there as with --api-host, and sprite URLs are <scheme>://<name>.<its host>. Replaces --url-domain and --public-listen")
+	spritesPublic := flag.String("sprites-public-url", "", "the public URL of --listen behind a proxy that forwards that host and every name under it (e.g. https://sprites.example.com): the Sprites API is served there as with --api-host, and sprite URLs are <scheme>://<name>.<its host>. With --url-domain too, those domains are served behind the same proxy as well (their sprites keep their names), and this host stays the default for new sprites. Replaces --public-listen")
 	daytonaPublic := flag.String("daytona-public-url", "", "the public URL of --daytona-listen behind a proxy (e.g. https://daytona.example.com): previews are <scheme>://<port>-<id>.<its host> and the toolbox is under it, instead of --daytona-domain with the listen port")
 	flag.Parse()
 	opts, f := finish()
@@ -106,11 +106,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "--sprites-public-url: %v\n", err)
 		os.Exit(2)
 	} else if u != nil {
-		if bad := setFlags("url-domain", "public-listen"); bad != "" {
+		if bad := setFlags("public-listen"); bad != "" {
 			fmt.Fprintf(os.Stderr, "--sprites-public-url replaces --%s; drop one\n", bad)
 			os.Exit(2)
 		}
-		f.BehindProxy(&opts, u)
+		f.BehindProxy(&opts, u, setFlags("url-domain") != "")
 	}
 	*e2bDomain = reportedDomain(*e2bDomain, *e2bListen, pub[0])
 	*vercelDomain = reportedDomain(*vercelDomain, *vercelListen, pub[1])
