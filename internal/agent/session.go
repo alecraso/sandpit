@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -260,17 +261,28 @@ func defaultUser() (cred *syscall.Credential, home, name string) {
 }
 
 // baseEnv is the environment every exec session and service starts from.
-// A sprite made from a container image adds the image's environment (imageenv.go).
+// PATH ends with the user's ~/.local/bin, after the system directories so it
+// cannot shadow them: tools installed there (an npm or pip --user install, a
+// symlinked CLI) are found by name, as on sprites.dev.
+// A sprite made from a container image adds the image's environment (imageenv.go);
+// an image's own PATH gets ~/.local/bin last too.
 func baseEnv(home, uname string) []string {
 	shell := loginShell()
 	if shell == "" {
 		shell = "/bin/sh"
 	}
+	localBin := filepath.Join(home, ".local", "bin")
 	env := []string{
-		"PATH=" + defaultPath,
+		"PATH=" + defaultPath + ":" + localBin,
 		"HOME=" + home, "USER=" + uname, "LOGNAME=" + uname, "LANG=C.UTF-8", "SHELL=" + shell,
 	}
-	return append(env, imageEnv()...)
+	for _, kv := range imageEnv() {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok && !strings.Contains(":"+v+":", ":"+localBin+":") {
+			kv += ":" + localBin
+		}
+		env = append(env, kv)
+	}
+	return env
 }
 
 // Start launches a command and registers the session.
