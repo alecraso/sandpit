@@ -29,7 +29,7 @@ RUN set -eu; cd /tmp; \
     curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt" | grep " $f\$" | sha256sum -c -; \
     tar -xJf "$f" -C /usr/local --strip-components=1 --no-same-owner \
       --exclude CHANGELOG.md --exclude LICENSE --exclude README.md; \
-    rm "$f"; \
+    rm "$f"; corepack enable; \
     chmod -R a+rwX /usr/local; \
     node --version; npm --version
 

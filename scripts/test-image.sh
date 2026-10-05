@@ -77,12 +77,15 @@ check "flock" flock -n "$t" true
 check "ldd" ldd /bin/sh
 check "openssl" openssl version
 check "curl" curl --version
+check "yarn (corepack)" command -v yarn
 for c in git tar jq rg; do check "$c" command -v "$c"; done
 exit "$fails"
 EOS
 
 # Exactly sandpit's exec environment for sprite (home /home/sprite).
-EXEC_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/sprite/.local/bin
+DEFAULT_PATH=$(sed -n 's/^const defaultPath = "\(.*\)"$/\1/p' internal/agent/imageenv.go)
+[ -n "$DEFAULT_PATH" ] || { echo "test-image: no defaultPath in internal/agent/imageenv.go" >&2; exit 2; }
+EXEC_PATH=$DEFAULT_PATH:/home/sprite/.local/bin
 run() { "$rt" run --rm -u sprite -w /home/sprite "$IMG" "$@"; }
 status=0
 echo "== as sprite, bash -lc"

@@ -100,14 +100,14 @@ The disk has the base image's size (20 GB apparent, sparse; `SPRITE_DISK_GB` at 
 
 ### The base image
 
-`images/base` ships Node 24 (nodejs.org tarball in `/usr/local`, checksum-verified; npm and
-corepack with it) and makes `/usr/local` world-writable, so `npm install -g` works as `sprite`
+`images/base` ships Node 24 (nodejs.org tarball in `/usr/local`, checksum-verified; npm, and
+corepack enabled) and makes `/usr/local` world-writable, so `npm install -g` works as `sprite`
 without sudo. `/home/sprite/.local`, `.local/bin` and `.local/share` exist and belong to
 `sprite`. This adds about 200 MB to the base (a container build went from 584 MB to 781 MB;
 the block counts quoted elsewhere in this page predate it).
 
 Exec sessions and services get `~/.local/bin` last on `PATH`, after the system directories
-(a sprite made from an image with its own `PATH` keeps that). That is the agent's doing, not
+(a sprite made from an image with its own `PATH` gets it last on that one). That is the agent's doing, not
 the image's: an `ENV PATH` in the Containerfile never reaches the default disk. It needs
 `make initrd` and takes effect at a sprite's next cold boot; a warm resume keeps the old
 agent. Existing sprites keep their disks, so only sprites created after `make image` have Node.

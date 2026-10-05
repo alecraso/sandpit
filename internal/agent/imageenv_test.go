@@ -23,7 +23,8 @@ func TestImageEnv(t *testing.T) {
 		t.Fatalf("imageEnv = %q, want %q", env, want)
 	}
 	base := baseEnv("/home/sprite", "sprite")
-	if "PATH="+envValue(base, "PATH") != want[0] || envValue(base, "HOME") != "/home/sprite" || envValue(base, "GOPATH") != "/go" {
+	// The image's PATH wins, with the user's ~/.local/bin last on it too.
+	if "PATH="+envValue(base, "PATH") != want[0]+":/home/sprite/.local/bin" || envValue(base, "HOME") != "/home/sprite" || envValue(base, "GOPATH") != "/go" {
 		t.Fatalf("baseEnv = %q", base)
 	}
 
