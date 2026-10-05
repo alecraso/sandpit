@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -260,6 +261,9 @@ func defaultUser() (cred *syscall.Credential, home, name string) {
 }
 
 // baseEnv is the environment every exec session and service starts from.
+// PATH ends with the user's ~/.local/bin, after the system directories so it
+// cannot shadow them: tools installed there (an npm or pip --user install, a
+// symlinked CLI) are found by name, as on sprites.dev.
 // A sprite made from a container image adds the image's environment (imageenv.go).
 func baseEnv(home, uname string) []string {
 	shell := loginShell()
@@ -267,7 +271,7 @@ func baseEnv(home, uname string) []string {
 		shell = "/bin/sh"
 	}
 	env := []string{
-		"PATH=" + defaultPath,
+		"PATH=" + defaultPath + ":" + filepath.Join(home, ".local", "bin"),
 		"HOME=" + home, "USER=" + uname, "LOGNAME=" + uname, "LANG=C.UTF-8", "SHELL=" + shell,
 	}
 	return append(env, imageEnv()...)

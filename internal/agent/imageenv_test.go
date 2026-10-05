@@ -38,3 +38,17 @@ func TestImageEnv(t *testing.T) {
 		t.Error("a file that is not executable is not a command")
 	}
 }
+
+// A sprite with no image environment (the default disk) gets the user's
+// ~/.local/bin on PATH, after the system directories so it cannot shadow them.
+func TestBaseEnvLocalBin(t *testing.T) {
+	old := imageMetaPath
+	imageMetaPath = filepath.Join(t.TempDir(), "image.json")
+	t.Cleanup(func() { imageMetaPath = old })
+
+	got := envValue(baseEnv("/home/sprite", "sprite"), "PATH")
+	want := defaultPath + ":/home/sprite/.local/bin"
+	if got != want {
+		t.Fatalf("PATH = %q, want %q", got, want)
+	}
+}
