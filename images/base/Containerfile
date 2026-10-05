@@ -15,3 +15,25 @@ RUN userdel -r ubuntu 2>/dev/null; \
     useradd -m -u 1000 -s /bin/bash sprite \
     && echo 'sprite ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sprite && chmod 0440 /etc/sudoers.d/sprite \
     && echo sprite > /etc/hostname
+
+# Node 24 for the agent runtimes that run on a sprite (Fountain's claude adapter
+# installs with npm and records `node -p process.execPath`). System node, not nvm:
+# exec sessions never source a profile. The arch comes from dpkg, so this builds
+# on arm64 hosts too. /usr/local is made world-writable so `npm install -g` works
+# as sprite without sudo; in this layer, since a later chmod -R would copy Node.
+ARG NODE_VERSION=24.21.0
+RUN set -eu; cd /tmp; \
+    case "$(dpkg --print-architecture)" in amd64) a=x64 ;; arm64) a=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac; \
+    f="node-v$NODE_VERSION-linux-$a.tar.xz"; \
+    curl -fsSLO "https://nodejs.org/dist/v$NODE_VERSION/$f"; \
+    curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt" | grep " $f\$" | sha256sum -c -; \
+    tar -xJf "$f" -C /usr/local --strip-components=1 --no-same-owner \
+      --exclude CHANGELOG.md --exclude LICENSE --exclude README.md; \
+    rm "$f"; \
+    chmod -R a+rwX /usr/local; \
+    node --version; npm --version
+
+# ~/.local/bin is on the exec PATH (internal/agent/session.go). Created here as
+# sprite: a root-owned ~/.local would make an adapter install under it fail with
+# EACCES.
+RUN install -d -o sprite -g sprite -m 755 /home/sprite/.local /home/sprite/.local/bin /home/sprite/.local/share
